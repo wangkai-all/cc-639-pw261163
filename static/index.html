@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DICOM 收件工作站（合成样本演示）</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/vendor/vue.global.prod.js"></script>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <h1>DICOM 收件工作站</h1>
+    <span class="sub">全部样本程序生成 · 不涉及真实病人 · 不做诊断</span>
+    <nav class="tabs">
+      <button :class="{active: tab==='query'}" @click="tab='query'">查询与接收</button>
+      <button :class="{active: tab==='local'}" @click="switchTab('local')">本地接收库</button>
+      <button :class="{active: tab==='reports'}" @click="switchTab('reports')">报告与导出</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ======================= 查询与接收 ======================= -->
+    <section v-if="tab==='query'">
+      <div class="panel">
+        <div class="toolbar">
+          <button class="btn" @click="queryStudies" :disabled="remote.loading">
+            {{ remote.loading ? '查询中…' : '查询演示影像服务' }}
+          </button>
+          <span class="muted">C-FIND（检查 → 序列 → 实例）· C-MOVE 接收到本机库</span>
+        </div>
+        <div v-if="remote.error" class="error-box">{{ remote.error }}</div>
+
+        <table class="grid" v-if="remote.studies.length">
+          <thead>
+            <tr><th>患者（合成）</th><th>患者ID</th><th>检查描述</th><th>检查日期</th>
+                <th>模态</th><th>序列数</th><th>实例数</th><th>Study Instance UID</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in remote.studies" :key="s.StudyInstanceUID"
+                class="clickable" :class="{selected: remote.study===s.StudyInstanceUID}"
+                @click="selectStudy(s.StudyInstanceUID)">
+              <td>{{ s.PatientName }}</td>
+              <td class="mono">{{ s.PatientID }}</td>
+              <td>{{ s.StudyDescription }}</td>
+              <td class="mono">{{ s.StudyDate }}</td>
+              <td>{{ (s.ModalitiesInStudy||[]).join('/') }}</td>
+              <td>{{ s.NumberOfStudyRelatedSeries }}</td>
+              <td>{{ s.NumberOfStudyRelatedInstances }}</td>
+              <td class="mono">{{ s.StudyInstanceUID }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel" v-if="remote.series.length">
+        <h2>序列（{{ remote.series.length }}）</h2>
+        <table class="grid">
+          <thead>
+            <tr><th>#</th><th>模态</th><th>序列描述</th><th>实例数</th>
+                <th>Series Instance UID</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="se in remote.series" :key="se.SeriesInstanceUID"
+                class="clickable" :class="{selected: remote.seriesUid===se.SeriesInstanceUID}"
+                @click="selectSeries(se)">
+              <td>{{ se.SeriesNumber }}</td>
+              <td>{{ se.Modality }}</td>
+              <td>{{ se.SeriesDescription }}</td>
+              <td>{{ se.NumberOfSeriesRelatedInstances }}</td>
+              <td class="mono">{{ se.SeriesInstanceUID }}</td>
+              <td>
+                <button class="btn" @click.stop="retrieveSeries(se)"
+                        :disabled="remote.retrieving===se.SeriesInstanceUID">
+                  {{ remote.retrieving===se.SeriesInstanceUID ? '接收中…' : '接收此序列' }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel" v-if="remote.instances.length">
+        <h2>实例（{{ remote.instances.length }}）— 来自演示服务的预告</h2>
+        <table class="grid">
+          <thead>
+            <tr><th>#</th><th>SOP Class</th><th>SOP Instance UID</th><th>传输语法</th><th>备注</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="i in remote.instances" :key="i.SOPInstanceUID + i.InstanceNumber">
+              <td>{{ i.InstanceNumber }}</td>
+              <td class="mono">{{ sopClassName(i.SOPClassUID) }}</td>
+              <td class="mono">{{ i.SOPInstanceUID }}</td>
+              <td class="mono">{{ tsName(i.TransferSyntaxUID) }}</td>
+              <td><span v-if="i.InstanceAvailabilityNote" class="badge warn">{{ i.InstanceAvailabilityNote }}</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel" v-if="retrieveReport">
+        <h2>接收结果</h2>
+        <div class="kv">
+          <dt>操作号</dt><dd>{{ retrieveReport.op_id }}</dd>
+          <dt>最终状态</dt><dd>{{ retrieveReport.final_status }}</dd>
+          <dt>子操作</dt><dd>{{ JSON.stringify(retrieveReport.suboperations) }}</dd>
+        </div>
+        <table class="grid" v-if="retrieveResults.length">
+          <thead><tr><th>SOP Instance UID</th><th>结果</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr v-for="r in retrieveResults" :key="r.sop_instance_uid + r.received_at">
+              <td class="mono">{{ r.sop_instance_uid }}</td>
+              <td><span class="badge" :class="statusBadge(r.status)">{{ statusText(r.status) }}</span></td>
+              <td class="mono">{{ r.detail ? JSON.stringify(r.detail) : '' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="info-box">已写入本地接收库，切换到「本地接收库」查看层级、字段与引用。</div>
+      </div>
+    </section>
+
+    <!-- ======================= 本地接收库 ======================= -->
+    <section v-if="tab==='local'">
+      <div class="layout-split">
+        <div>
+          <div class="panel">
+            <div class="toolbar">
+              <h2 style="margin:0">检查 / 序列 / 实例</h2>
+              <button class="btn ghost" @click="loadLocal">刷新</button>
+            </div>
+            <div v-if="!local.hierarchy.length" class="muted">本地库为空，请先在「查询与接收」中接收序列。</div>
+            <div class="tree">
+              <details v-for="st in local.hierarchy" :key="st.study_uid" open>
+                <summary>
+                  <strong>检查</strong> {{ st.study_description || '(无描述)' }}
+                  <span class="muted mono">{{ shortUid(st.study_uid) }}</span>
+                </summary>
+                <details v-for="se in st.series" :key="se.series_uid" open>
+                  <summary>
+                    <strong>序列</strong> {{ se.series_number }} · {{ se.modality }} ·
+                    {{ se.series_description }}
+                    <span class="muted">({{ se.instances.length }} 实例)</span>
+                  </summary>
+                  <div v-for="i in se.instances" :key="i.sop_instance_uid"
+                       class="inst" :class="{selected: local.selected===i.sop_instance_uid}"
+                       @click="selectInstance(i.sop_instance_uid)">
+                    <span>实例 {{ i.instance_number }}</span>
+                    <span class="badge" :class="statusBadge(i.status)">{{ statusText(i.status) }}</span>
+                    <span class="muted mono">{{ tsName(i.transfer_syntax) }}</span>
+                  </div>
+                </details>
+              </details>
+            </div>
+          </div>
+
+          <div class="panel" v-if="conflicts.length">
+            <h2>标识冲突（同一 SOP Instance UID 不同内容）</h2>
+            <div v-for="c in conflicts" :key="c.sop_instance_uid" class="error-box">
+              <div class="mono">{{ c.sop_instance_uid }}</div>
+              <div>已保留 {{ c.versions.length }} 个版本，未覆盖。差异字段：</div>
+              <div v-for="(v, k) in c.conflict" :key="k" class="mono">
+                {{ k }}: 已存={{ v.stored }} / 新收={{ v.received }}
+              </div>
+            </div>
+          </div>
+
+          <div class="panel" v-if="quarantine.length">
+            <h2>隔离区（文件元信息 / 数据集标识不一致）</h2>
+            <div v-for="q in quarantine" :key="q.sop_instance_uid" class="error-box">
+              <div class="mono">{{ q.sop_instance_uid }}</div>
+              <div v-for="(v, k) in q.meta_mismatch" :key="k" class="mono">
+                {{ k }}: 文件元信息={{ v.file_meta }} / 数据集={{ v.dataset }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="panel" v-if="local.detail">
+            <h2>实例详情</h2>
+            <div class="kv">
+              <dt>状态</dt><dd><span class="badge" :class="statusBadge(local.detail.entry.status)">{{ statusText(local.detail.entry.status) }}</span></dd>
+              <dt>SOP Instance UID</dt><dd>{{ local.detail.entry.sop_instance_uid }}</dd>
+              <dt>SOP Class</dt><dd>{{ sopClassName(local.detail.entry.sop_class_uid) }}</dd>
+              <dt>传输语法</dt><dd>{{ tsName(local.detail.entry.transfer_syntax) }}</dd>
+              <dt>内容哈希</dt><dd>{{ local.detail.entry.content_hash }}</dd>
+            </div>
+
+            <div class="cols-2">
+              <div>
+                <h3>像素预览（仅用于核对实例，不作诊断）</h3>
+                <div class="pixel-box" v-if="local.detail.has_pixels">
+                  <img :src="pixelUrl" @error="pixelError=true" v-if="!pixelError" alt="像素预览">
+                  <div v-if="pixelError" class="muted">该传输语法暂不支持预览</div>
+                </div>
+                <div v-else class="muted">该实例不含像素数据。</div>
+
+                <h3>引用关系</h3>
+                <div v-if="local.refs">
+                  <div v-if="!local.refs.outgoing.length && !local.refs.incoming.length" class="muted">无引用。</div>
+                  <div v-for="r in local.refs.outgoing" :key="r.path + r.referenced_sop_instance_uid">
+                    <span class="badge" :class="r.status==='present' ? 'ok' : 'bad'">
+                      {{ r.status==='present' ? '被引实例在库' : '被引实例缺失' }}
+                    </span>
+                    <span class="mono">{{ r.referenced_sop_instance_uid }}</span>
+                    <div class="ref-path">{{ r.path }}</div>
+                  </div>
+                  <div v-for="u in local.refs.incoming" :key="u">
+                    <span class="badge neutral">被引用自</span> <span class="mono">{{ u }}</span>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <h3>结构化字段（按分组）</h3>
+                <field-groups :rows="local.detail.fields"></field-groups>
+              </div>
+            </div>
+          </div>
+          <div class="panel" v-else>
+            <div class="muted">从左侧层级树选择一个实例查看结构化字段、引用关系与像素预览。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= 报告与导出 ======================= -->
+    <section v-if="tab==='reports'">
+      <div class="panel">
+        <div class="toolbar">
+          <h2 style="margin:0">导出下载包</h2>
+          <button class="btn" @click="exportZip" :disabled="exporting">
+            {{ exporting ? '生成中…' : '生成并下载 ZIP' }}
+          </button>
+          <button class="btn danger" @click="resetStore">清空本地库</button>
+        </div>
+        <div class="info-box">
+          下载包包含：按检查/序列/实例分层的结构化表（JSON+CSV）、匿名化 DICOM 文件、
+          引用完整性报告、匿名化规则与不含原身份的处理摘要。
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>接收报告</h2>
+        <table class="grid" v-if="reports.receiving.length">
+          <thead><tr><th>操作号</th><th>开始</th><th>结束</th><th>序列</th><th>结果统计</th></tr></thead>
+          <tbody>
+            <tr v-for="op in reports.receiving" :key="op.id">
+              <td class="mono">{{ op.id }}</td>
+              <td class="mono">{{ op.started_at }}</td>
+              <td class="mono">{{ op.finished_at || '—' }}</td>
+              <td class="mono">{{ shortUid(op.series_uid) }}</td>
+              <td>
+                <span v-for="(n, st) in op.summary" :key="st" class="badge" :class="statusBadge(st)">
+                  {{ statusText(st) }} × {{ n }}
+                </span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="muted">尚无接收记录。</div>
+      </div>
+
+      <div class="panel">
+        <h2>引用完整性报告</h2>
+        <div v-if="reports.integrity">
+          <div class="kv">
+            <dt>在库实例</dt><dd>{{ reports.integrity.summary.stored_instances }}</dd>
+            <dt>隔离</dt><dd>{{ reports.integrity.summary.quarantined_instances }}</dd>
+            <dt>冲突</dt><dd>{{ reports.integrity.summary.conflict_instances }}</dd>
+            <dt>引用总数</dt><dd>{{ reports.integrity.summary.total_references }}</dd>
+            <dt>缺失引用</dt><dd>{{ reports.integrity.summary.missing_references }}</dd>
+          </div>
+          <table class="grid" v-if="reports.integrity.missing.length">
+            <thead><tr><th>引用方实例</th><th>缺失的被引实例</th><th>位置</th></tr></thead>
+            <tbody>
+              <tr v-for="m in reports.integrity.missing" :key="m.from_instance + m.missing_sop_instance_uid">
+                <td class="mono">{{ m.from_instance }}</td>
+                <td class="mono">{{ m.missing_sop_instance_uid }}</td>
+                <td class="ref-path">{{ m.path }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel" v-if="reports.rules">
+        <h2>匿名化规则（随导出包附带）</h2>
+        <p class="muted">{{ reports.rules.description }}</p>
+        <h3>移除字段（身份 / 人口学 / 日期时间）</h3>
+        <div class="rules-list"><div v-for="k in reports.rules.remove_keywords" :key="k">{{ k }}</div></div>
+        <h3>保留的采集参数</h3>
+        <div class="rules-list"><div v-for="k in reports.rules.keep_acquisition_keywords" :key="k">{{ k }}</div></div>
+        <h3>UID 重映射</h3>
+        <div class="kv">
+          <dt>重映射对象</dt><dd>{{ reports.rules.uid_remap.remapped_keywords.join(', ') }}</dd>
+          <dt>绝不重映射</dt><dd>{{ reports.rules.uid_remap.never_remapped_keywords.join(', ') }}</dd>
+          <dt>映射范围</dt><dd>{{ reports.rules.uid_remap.mapping_scope }}</dd>
+          <dt>传输语法策略</dt><dd>{{ reports.rules.transfer_syntax_policy }}</dd>
+          <dt>私有字段默认</dt><dd>{{ reports.rules.private_tags.default }}</dd>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
